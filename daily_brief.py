@@ -6,12 +6,6 @@ Runs on a cron schedule via Render. Pipeline:
   3. Get top 3 X-trending stories via Grok Responses API + x_search
   4. Synthesize 3-story brief via Claude; append 5 notable links in Python
   5. Send formatted HTML email via Gmail SMTP
-
-Patches applied:
-  - Issue 1: env var errors caught at startup with clear message
-  - Issue 4: word-boundary regex for short ambiguous keywords (SEC, NFT, EVM, etc.)
-  - Issue 6: pipe-safe article block format with labeled fields
-  - Issue 7: Grok polling handles both 'queued' and 'in_progress' statuses
 """
 
 import os
@@ -26,12 +20,13 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 # ── Environment variables ─────────────────────────────────────────────────────
-# Validated at startup with clear error messages rather than cryptic KeyError.
 def _require_env(key):
     val = os.environ.get(key)
     if not val:
-        raise SystemExit(f"ERROR: Required environment variable '{key}' is not set. "
-                         f"Add it in Render → Environment before deploying.")
+        raise SystemExit(
+            f"ERROR: Required environment variable '{key}' is not set. "
+            f"Add it in Render → Environment before deploying."
+        )
     return val
 
 XAI_API_KEY        = _require_env("XAI_API_KEY")
@@ -55,31 +50,20 @@ RSS_FEEDS = [
 STRIP_HTML = re.compile(r"<[^>]+>")
 
 # ── Keyword relevance scoring ─────────────────────────────────────────────────
-# Derived from ChainifyIT litepaper. Scored on title only — fast, free, no API.
-# Score 3 = core business, Score 2 = regulatory/institutional, Score 1 = general.
-# Zero-score articles are dropped before Claude is called.
-#
-# PATCH (Issue 4): short uppercase/proper-noun keywords use word-boundary regex
-# to prevent false matches (SEC in "second", Ondo in "London", NFT in nothing
-# but guarded anyway, Maple in "maple syrup", EVM in "government").
-# Multi-word and stem keywords use plain substring match — safe by construction.
-
-# Keywords matched with word-boundary regex (avoids substring false positives)
 BOUNDARY_KEYWORDS = {
-    "SEC":      2,
-    "CFTC":     2,
-    "MiCA":     2,
-    "RWA":      3,
-    "NFT":      3,
-    "EVM":      2,
-    "Ondo":     2,
-    "Maple":    2,
+    "SEC":   2,
+    "CFTC":  2,
+    "MiCA":  2,
+    "RWA":   3,
+    "NFT":   3,
+    "EVM":   2,
+    "Ondo":  2,
+    "Maple": 2,
 }
 
-# Keywords matched with plain substring (stems, phrases, long proper nouns)
 SUBSTRING_KEYWORDS = {
-    "tokeniz":            3,   # tokenization, tokenized, tokenizing
-    "tokenis":            3,   # British spelling
+    "tokeniz":            3,
+    "tokenis":            3,
     "real-world asset":   3,
     "real world asset":   3,
     "smart contract":     3,
@@ -108,7 +92,6 @@ SUBSTRING_KEYWORDS = {
     "fintech":            1,
 }
 
-# Pre-compile boundary patterns once at module load
 _BOUNDARY_PATTERNS = {
     kw: re.compile(r'\b' + re.escape(kw) + r'\b', re.IGNORECASE)
     for kw in BOUNDARY_KEYWORDS
@@ -117,33 +100,79 @@ _BOUNDARY_PATTERNS = {
 
 def rank_articles(articles):
     """
-    Score each article by keyword hits in title only.
-    Boundary keywords use regex word-boundary matching.
-    Substring keywords use plain case-insensitive contains.
-    Drop zeros. Sort descending. Return all ranked articles.
+    Score by keyword hits in title only. Returns a tuple:
+      (ranked, unranked) — ranked sorted descending, unranked are zero-score
+    articles kept as fallback for the Also Notable section on quiet news days.
     """
     scored = []
+    unranked = []
     for a in articles:
         title = a["title"]
         title_lower = title.lower()
-
         score = 0
-        # Boundary-matched keywords
         for kw, weight in BOUNDARY_KEYWORDS.items():
             if _BOUNDARY_PATTERNS[kw].search(title):
                 score += weight
-        # Substring-matched keywords
         for kw, weight in SUBSTRING_KEYWORDS.items():
             if kw.lower() in title_lower:
                 score += weight
-
         if score > 0:
             scored.append((score, a))
+        else:
+            unranked.append(a)
 
     scored.sort(key=lambda x: x[0], reverse=True)
     ranked = [a for _, a in scored]
     print(f"Ranked {len(ranked)} relevant articles from {len(articles)} total.")
-    return ranked
+    return ranked, unranked
+
+
+# ── Markdown to HTML converter ────────────────────────────────────────────────
+def markdown_to_html(text):
+    """
+    Convert Claude's markdown output to HTML for proper email rendering.
+    Handles: ## headers, **bold**, and paragraph breaks.
+    Keeps it simple — only the patterns Claude actually outputs.
+    """
+    # Escape HTML special chars first
+    text = html_lib.escape(text)
+
+    # Convert ## headers to styled divs
+    text = re.sub(
+        r'^## (.+)$',
+        r'<div style="font-size:16px;font-weight:bold;color:#1A2B4A;'
+        r'margin:24px 0 8px;padding-bottom:4px;border-bottom:1px solid #e0e0e0">\1</div>',
+        text, flags=re.MULTILINE
+    )
+
+    # Convert **bold** to <strong>
+    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+
+    # Convert --- dividers to visual separators
+    text = re.sub(
+        r'^---$',
+        r'<hr style="border:none;border-top:1px solid #eee;margin:20px 0">',
+        text, flags=re.MULTILINE
+    )
+
+    # Convert double newlines to paragraph breaks
+    # Single newlines within a paragraph preserved as <br>
+    paragraphs = text.split('\n\n')
+    html_parts = []
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        # Already-converted HTML tags pass through unchanged
+        if para.startswith('<div') or para.startswith('<hr'):
+            html_parts.append(para)
+        else:
+            para = para.replace('\n', '<br>')
+            html_parts.append(
+                f'<p style="margin:0 0 12px;line-height:1.7">{para}</p>'
+            )
+
+    return '\n'.join(html_parts)
 
 
 # ── Step 1: RSS ───────────────────────────────────────────────────────────────
@@ -179,12 +208,9 @@ def fetch_articles():
 # ── Step 2: Grok x_search — top 3 trending stories ───────────────────────────
 def fetch_x_stories():
     """
-    Returns top 3 most-discussed RWA/digital asset stories on X in the last 24h.
-    Claude uses this to weight RSS story selection.
+    Returns top 3 most-discussed RWA/digital asset stories on X in last 24h.
     x_search only available on Responses API (/v1/responses).
-
-    PATCH (Issue 7): polling loop now handles both 'queued' and 'in_progress'
-    statuses, preventing premature fallback on queued responses.
+    Polling handles both 'queued' and 'in_progress' statuses.
     """
     payload = {
         "model": "grok-4-1-fast",
@@ -226,7 +252,6 @@ def fetch_x_stories():
         r.raise_for_status()
         data = r.json()
 
-        # Poll on both 'queued' and 'in_progress' — the API may queue before processing
         poll_attempts = 0
         while data.get("status") in ("queued", "in_progress") and poll_attempts < 10:
             poll_attempts += 1
@@ -256,19 +281,22 @@ def fetch_x_stories():
 
 
 # ── Step 3: Claude synthesis ──────────────────────────────────────────────────
-def generate_brief(articles, x_stories):
+def generate_brief(ranked, unranked, x_stories):
     today = datetime.now().strftime("%A, %B %d, %Y")
 
-    # Top 20 go to Claude. Articles 21-25 become the "Also Notable" section,
-    # built in Python — no Claude tokens spent on simple list formatting.
-    top_articles = articles[:20]
-    also_notable = articles[20:25]
+    # Top 20 ranked go to Claude.
+    # Also Notable: articles 21-25 from ranked list.
+    # If fewer than 21 ranked articles exist, pad with unranked articles
+    # so the section never appears empty on quiet news days.
+    top_articles = ranked[:20]
+    also_notable = ranked[20:25]
+    if len(also_notable) < 5:
+        shortfall = 5 - len(also_notable)
+        also_notable = also_notable + unranked[:shortfall]
 
-    # PATCH (Issue 6): labeled field format replaces pipe-delimited format.
-    # Pipe characters in financial headlines (e.g. "BlackRock | ETF Update")
-    # would break the previous format. Labeled fields are unambiguous.
     article_block = "\n\n".join(
-        f"SOURCE: {a['source']}\nTITLE: {a['title']}\nSUMMARY: {a['summary']}\nURL: {a['link']}"
+        f"SOURCE: {a['source']}\nTITLE: {a['title']}\n"
+        f"SUMMARY: {a['summary']}\nURL: {a['link']}"
         for a in top_articles
     )
 
@@ -300,16 +328,13 @@ def generate_brief(articles, x_stories):
                 "**Source:** [Publication] | [Date]\n"
                 "**Link:** [URL]\n\n"
                 "**What Happened**\n"
-                "[One paragraph. Facts only — what occurred, who was involved, "
-                "key figures or deadlines. No analysis.]\n\n"
+                "[One paragraph. Facts only.]\n\n"
                 "**What It Means for ChainifyIT**\n"
-                "[One paragraph. Strategic implications only — competitive impact, "
-                "client opportunities, risks, required actions. No news summary.]\n\n"
+                "[One paragraph. Strategic implications only.]\n\n"
                 "---\n\n"
                 "After the three stories:\n\n"
                 "## Market Pulse\n"
-                "[2 sentences. What X is most focused on today and whether it "
-                "aligns with or diverges from RSS coverage.]"
+                "[2 sentences. X focus today and whether it aligns with RSS coverage.]"
             ),
         }],
     }
@@ -334,50 +359,63 @@ def generate_brief(articles, x_stories):
 def send_email(brief, also_notable):
     today = datetime.now().strftime("%B %d, %Y")
 
-    # "Also Notable" — clickable linked titles, built in Python (no Claude tokens).
+    # Convert Claude's markdown to HTML for proper rendering
+    brief_html = markdown_to_html(brief)
+
+    # Also Notable — clickable linked titles, built in Python
     if also_notable:
         notable_items = "".join(
-            f'<li style="margin-bottom:6px">'
+            f'<li style="margin-bottom:8px">'
             f'<a href="{html_lib.escape(a["link"])}" '
-            f'style="color:#1A2B4A;text-decoration:none">'
+            f'style="color:#1A2B4A;text-decoration:none;font-size:14px">'
             f'{html_lib.escape(a["title"])}</a>'
-            f' <span style="color:#888;font-size:12px">'
-            f'— {html_lib.escape(a["source"])}</span>'
+            f'<span style="color:#888;font-size:12px"> — {html_lib.escape(a["source"])}</span>'
             f'</li>'
             for a in also_notable
         )
         notable_block = (
-            '<div style="margin-top:32px;padding-top:16px;border-top:1px solid #ddd">'
-            '<p style="font-weight:bold;color:#1A2B4A;margin:0 0 10px;font-size:14px">'
-            'ALSO NOTABLE</p>'
-            f'<ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.8">'
+            '<div style="margin-top:32px;padding-top:20px;border-top:2px solid #eee">'
+            '<p style="font-weight:bold;color:#1A2B4A;margin:0 0 12px;'
+            'font-size:13px;letter-spacing:1px;text-transform:uppercase">'
+            'Also Notable</p>'
+            f'<ul style="margin:0;padding-left:16px;list-style:none">'
             f'{notable_items}</ul></div>'
         )
     else:
         notable_block = ""
 
-    brief_escaped = html_lib.escape(brief)
-
     html_body = (
-        '<html><body style="font-family:Georgia,serif;max-width:680px;margin:40px auto;'
-        'color:#1a1a1a;line-height:1.7;font-size:15px">'
-        '<div style="border-bottom:2px solid #1A2B4A;padding-bottom:10px;margin-bottom:24px">'
-        '<h2 style="color:#1A2B4A;margin:0;font-size:17px;letter-spacing:0.5px">'
-        'INTERLINK CAPITAL STRATEGIES</h2>'
-        '<p style="margin:4px 0 0;color:#888;font-size:12px;font-style:italic">'
-        f'ChainifyIT Daily Intelligence Brief &mdash; {today}</p></div>'
-        f'<div style="white-space:pre-wrap">{brief_escaped}</div>'
+        '<!DOCTYPE html><html><body style="font-family:Georgia,serif;'
+        'max-width:680px;margin:40px auto;color:#1a1a1a;font-size:15px">'
+
+        # Header
+        '<div style="border-bottom:3px solid #1A2B4A;padding-bottom:12px;margin-bottom:28px">'
+        '<div style="font-size:11px;color:#888;letter-spacing:2px;'
+        'text-transform:uppercase;margin-bottom:4px">Interlink Capital Strategies</div>'
+        '<div style="font-size:20px;font-weight:bold;color:#1A2B4A">'
+        'ChainifyIT Intelligence Brief</div>'
+        f'<div style="font-size:13px;color:#888;margin-top:2px">{today}</div>'
+        '</div>'
+
+        # Main brief content
+        f'{brief_html}'
+
+        # Also Notable
         f'{notable_block}'
-        '<div style="border-top:1px solid #ddd;margin-top:36px;padding-top:10px;'
-        'font-size:11px;color:#999;font-style:italic">'
-        'AI-drafted. Requires analyst review before distribution.</div>'
+
+        # Footer
+        '<div style="border-top:1px solid #ddd;margin-top:40px;padding-top:12px;'
+        'font-size:11px;color:#aaa;font-style:italic">'
+        'AI-drafted. Requires analyst review before distribution. '
+        'Interlink Capital Strategies.</div>'
         '</body></html>'
     )
 
+    # Plain text fallback
     plain_notable = ""
     if also_notable:
         plain_notable = "\n\nALSO NOTABLE\n" + "\n".join(
-            f"- {a['title']} ({a['source']}) {a['link']}"
+            f"- {a['title']} ({a['source']})\n  {a['link']}"
             for a in also_notable
         )
 
@@ -385,8 +423,9 @@ def send_email(brief, also_notable):
     msg["Subject"] = f"ChainifyIT Daily Brief — {today}"
     msg["From"]    = f"Interlink Intelligence <{GMAIL_ADDRESS}>"
     msg["To"]      = RECIPIENT_EMAIL
-    msg.attach(MIMEText(brief + plain_notable, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
+    # Plain text first, HTML last — MIME standard; email clients prefer last part
+    msg.attach(MIMEText(brief + plain_notable, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
@@ -404,13 +443,13 @@ def main():
         print("No articles. Exiting.")
         return
 
-    articles = rank_articles(articles)
-    if not articles:
+    ranked, unranked = rank_articles(articles)
+    if not ranked:
         print("No relevant articles after ranking. Exiting.")
         return
 
     x_stories = fetch_x_stories()
-    brief, also_notable = generate_brief(articles, x_stories)
+    brief, also_notable = generate_brief(ranked, unranked, x_stories)
     send_email(brief, also_notable)
     print("\nDone.")
 
